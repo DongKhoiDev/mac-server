@@ -1,0 +1,249 @@
+import os
+import sys
+import psutil
+import asyncio
+import subprocess
+from datetime import datetime, timedelta
+import discord
+from discord.ext import tasks, commands
+import google.generativeai as genai
+
+REPO_DIR = "/home/dongkhoi/mac-server"
+CHANNEL_CACHE_FILE = "/home/dongkhoi/.last_channel_id"
+SECRETS_FILE = "/home/dongkhoi/.secrets"
+ALLOWED_USER_ID = 932202011812823070
+
+DISCORD_TOKEN = ""
+GEMINI_API_KEY = ""
+
+if os.path.exists(SECRETS_FILE):
+    with open(SECRETS_FILE, "r") as f:
+        for line in f:
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                if k == "DISCORD_TOKEN":
+                    DISCORD_TOKEN = v
+                elif k == "GEMINI_API_KEY":
+                    GEMINI_API_KEY = v
+
+MODELS_TO_TRY = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash"
+]
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="", intents=intents)
+
+last_alert_time = None
+is_alert_active = False
+
+def save_last_channel(channel_id):
+    try:
+        with open(CHANNEL_CACHE_FILE, "w") as f:
+            f.write(str(channel_id))
+    except Exception:
+        pass
+
+def get_last_channel_id():
+    if os.path.exists(CHANNEL_CACHE_FILE):
+        try:
+            with open(CHANNEL_CACHE_FILE, "r") as f:
+                return int(f.read().strip())
+        except Exception:
+            return None
+    return None
+
+def get_top_processes(sort_by="memory_percent", limit=10):
+    procs = []
+    for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]):
+        try:
+            procs.append(p.info)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    procs.sort(key=lambda x: x[sort_by] or 0, reverse=True)
+    
+    header = f"{'PID':<7}{'TIẾN TRÌNH':<16}{'RAM':<7}{'CPU':<6}\n"
+    divider = "-" * 36 + "\n"
+    lines = [header, divider]
+    for p in procs[:limit]:
+        name = p['name'][:14] if p['name'] else "unknown"
+        mem = f"{p['memory_percent']:.1f}%" if p['memory_percent'] is not None else "0.0%"
+        cpu = f"{p['cpu_percent']:.1f}%" if p['cpu_percent'] is not None else "0.0%"
+        lines.append(f"{p['pid']:<7}{name:<16}{mem:<7}{cpu:<6}\n")
+    return "".join(lines)
+
+async def send_chunked(destination, text: str, is_code: bool = False):
+    max_len = 1800
+    if not text:
+        return
+    for i in range(0, len(text), max_len):
+        chunk = text[i:i+max_len]
+        if is_code:
+            await destination.send(f"```bash\n{chunk}\n```")
+        else:
+            await destination.send(chunk)
+
+async def ask_gemini_with_fallback(prompt: str) -> str:
+    errors = []
+    for model_name in MODELS_TO_TRY:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = await asyncio.to_thread(model.generate_content, prompt)
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            errors.append(f"{model_name}: {e}")
+            continue
+    return "⚠️ Không có mô hình nào phản hồi:\n" + "\n".join(errors[:2])
+
+@bot.event
+async def on_ready():
+    print(f"Bot đã online: {bot.user}")
+    if not monitor_health.is_running():
+        monitor_health.start()
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+
+    if message.author.id != ALLOWED_USER_ID:
+        return
+
+    save_last_channel(message.channel.id)
+    raw_content = message.content.strip()
+    content = raw_content.lower()
+
+    if content in ["ping", "!ping", "hi", "hello"]:
+        await message.reply("Pong! Bot MacServerControl đang hoạt động bình thường.")
+        return
+
+    if content in ["stats", "!stats", "status"]:
+        cpu = psutil.cpu_percent(interval=1)
+        ram = psutil.virtual_memory()
+        disk = psutil.disk_usage("/")
+        boot_time = datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S")
+        stats_text = (
+            f"📊 **TRẠNG THÁI HỆ THỐNG MAC-SERVER**\n"
+            f"- **CPU:** {cpu}%\n"
+            f"- **RAM:** {ram.percent}% Dùng: {ram.used // (1024**2)}MB / {ram.total // (1024**2)}MB\n"
+            f"- **Ổ cứng:** {disk.percent}% Còn trống: {disk.free // (1024**3)}GB\n"
+            f"- **Thời gian bật:** {boot_time}"
+        )
+        await message.reply(stats_text)
+        return
+
+    if any(k in content for k in ["ngốn ram", "top ram", "tiến trình ram", "topram"]):
+        table = get_top_processes(sort_by="memory_percent", limit=10)
+        await message.reply(f"📈 **Top 10 tiến trình chiếm nhiều RAM nhất:**\n```text\n{table}```")
+        return
+
+    if any(k in content for k in ["ngốn cpu", "top cpu", "tiến trình cpu", "topcpu"]):
+        table = get_top_processes(sort_by="cpu_percent", limit=10)
+        await message.reply(f"📈 **Top 10 tiến trình chiếm nhiều CPU nhất:**\n```text\n{table}```")
+        return
+
+    if content in ["restart", "!restart", "reboot bot"]:
+        await message.reply("🔄 Đang khởi động lại dịch vụ bot qua systemd...")
+        subprocess.Popen(
+            "nohup bash -c 'sleep 2 && sudo systemctl restart discord-bot' > /dev/null 2>&1 &",
+            shell=True
+        )
+        return
+
+    if content in ["cập nhật bot", "cap nhat bot", "update bot", "git pull"]:
+        status_msg = await message.reply("🔄 Đang kiểm tra và tải mã nguồn mới từ Git...")
+        proc_pull = await asyncio.create_subprocess_shell(
+            "git pull origin main",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=REPO_DIR
+        )
+        stdout, stderr = await proc_pull.communicate()
+        out = stdout.decode().strip()
+
+        if "Already up to date" in out:
+            await status_msg.edit(content="✅ Bot đã ở phiên bản mới nhất trên Git.")
+            return
+
+        proc_check = await asyncio.create_subprocess_shell(
+            f"python3 -m py_compile {REPO_DIR}/discord_bot.py",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        _, err_check = await proc_check.communicate()
+
+        if proc_check.returncode != 0:
+            await asyncio.create_subprocess_shell("git reset --hard HEAD@{1}", cwd=REPO_DIR)
+            err_msg = err_check.decode().strip()[:400]
+            await status_msg.edit(content=f"⚠️ Bản cập nhật lỗi cú pháp. Đã tự rollback về bản cũ.\n```{err_msg}```")
+            return
+
+        await status_msg.edit(content=f"✅ Cập nhật thành công.\n```{out[:250]}```\nKhởi động lại bot sau 2 giây...")
+        subprocess.Popen("nohup bash -c 'sleep 2 && sudo systemctl restart discord-bot' > /dev/null 2>&1 &", shell=True)
+        return
+
+    if raw_content.startswith("$") or raw_content.startswith("sh "):
+        cmd = raw_content[1:].strip() if raw_content.startswith("$") else raw_content[3:].strip()
+        status_msg = await message.reply(f"⚡ Đang thực thi: `{cmd[:50]}`...")
+        try:
+            process = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd="/home/dongkhoi"
+            )
+            stdout, stderr = await process.communicate()
+            out = stdout.decode().strip()
+            err = stderr.decode().strip()
+            result = out if out else (err if err else "Lệnh hoàn thành không có output.")
+
+            if len(result) <= 1700:
+                await status_msg.edit(content=f"**Kết quả tại /home/dongkhoi:**\n```bash\n{result}\n```")
+            else:
+                await status_msg.edit(content="**Kết quả xuất theo khối:**")
+                await send_chunked(message.channel, result, is_code=True)
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Lỗi thực thi: `{e}`")
+        return
+
+    try:
+        reply_text = await ask_gemini_with_fallback(raw_content)
+        await send_chunked(message.channel, reply_text, is_code=False)
+    except Exception as e:
+        await message.reply(f"❌ Lỗi AI: {e}")
+
+@tasks.loop(minutes=2)
+async def monitor_health():
+    global last_alert_time, is_alert_active
+    cpu = psutil.cpu_percent()
+    ram = psutil.virtual_memory().percent
+
+    if cpu > 90 or ram > 90:
+        now = datetime.now()
+        if not is_alert_active or (last_alert_time and now - last_alert_time > timedelta(minutes=30)):
+            is_alert_active = True
+            last_alert_time = now
+            alert_msg = f"🚨 **CẢNH BÁO QUÁ TẢI TRÊN MACSERVER:**\n- CPU: {cpu}%\n- RAM: {ram}%"
+            channel_id = get_last_channel_id()
+            if channel_id:
+                channel = bot.get_channel(channel_id)
+                if channel:
+                    try:
+                        await channel.send(alert_msg)
+                    except Exception:
+                        pass
+    else:
+        is_alert_active = False
+
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        print("Chưa cấu hình DISCORD_TOKEN trong /home/dongkhoi/.secrets")
+        sys.exit(1)
+    bot.run(DISCORD_TOKEN)
