@@ -27,8 +27,6 @@ if os.path.exists(SECRETS_FILE):
                     GEMINI_API_KEY = v
 
 MODELS_TO_TRY = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite"
 ]
@@ -43,16 +41,15 @@ bot = commands.Bot(command_prefix="", intents=intents)
 last_alert_time = None
 is_alert_active = False
 
-# Biến lưu trữ phiên hội thoại dài hạn
 active_chat_session = None
 current_model_used = None
 
 SYSTEM_INSTRUCTION = (
     "Bạn là trợ lý điều hành máy chủ MacServerControl tên là JARVIS. "
-    "Bạn có trí nhớ ngữ cảnh để theo dõi mạch hội thoại với chủ nhân. "
-    "Bạn sở hữu các công cụ tra cứu phần cứng, kiểm tra tiến trình và thực thi lệnh shell Linux. "
-    "Khi người dùng yêu cầu kiểm tra máy chủ, xem dung lượng các ổ SSD và HDD, kiểm tra mạng, hoặc hỏi về các dịch vụ như Jellyfin, Immich, "
-    "hãy chủ động gọi công cụ phù hợp để lấy thông tin thật từ hệ thống rồi trả lời ngắn gọn, rành mạch."
+    "Bạn duy trì ngữ cảnh trò chuyện xuyên suốt nhiều lượt với chủ nhân. "
+    "Bạn có sẵn các công cụ tra cứu phần cứng, kiểm tra tiến trình, quản trị dịch vụ Docker và thực thi lệnh shell Linux an toàn. "
+    "Khi chủ nhân hỏi về trạng thái các ứng dụng như Jellyfin, Immich, qBittorrent, hoặc yêu cầu xem log, khởi động lại dịch vụ, "
+    "hãy tự động kích hoạt công cụ thích hợp để thao tác thực tế trên máy rồi phản hồi ngắn gọn, chính xác."
 )
 
 def get_system_stats() -> str:
@@ -71,7 +68,7 @@ def get_system_stats() -> str:
             usage = psutil.disk_usage(part.mountpoint)
             total_gb = usage.total // (1024**3)
             free_gb = usage.free // (1024**3)
-            disk_lines.append(f"  + {part.mountpoint} - thiết bị {part.device}: Trống {free_gb} GB trên tổng {total_gb} GB, đã dùng {usage.percent}%")
+            disk_lines.append(f"  + Điểm gắn {part.mountpoint} trên thiết bị {part.device}: Trống {free_gb} GB trên tổng {total_gb} GB, đã dùng {usage.percent}%")
         except PermissionError:
             continue
 
@@ -85,7 +82,7 @@ def get_system_stats() -> str:
     )
 
 def get_top_processes(sort_by: str = "memory", limit: int = 10) -> str:
-    """Tra cứu danh sách các tiến trình chiếm dụng nhiều tài nguyên nhất. sort_by có thể là memory hoặc cpu."""
+    """Tra cứu danh sách các tiến trình chiếm dụng nhiều tài nguyên nhất."""
     key = "cpu_percent" if sort_by.lower() == "cpu" else "memory_percent"
     procs = []
     for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]):
@@ -105,8 +102,46 @@ def get_top_processes(sort_by: str = "memory", limit: int = 10) -> str:
         lines.append(f"{p['pid']:<7}{name:<16}{mem:<7}{cpu:<6}\n")
     return "".join(lines)
 
+def list_docker_containers(all_containers: bool = True) -> str:
+    """Liệt kê danh sách các container Docker kèm trạng thái đang chạy hoặc đã dừng."""
+    flag = "-a" if all_containers else ""
+    cmd = f"docker ps {flag} --format 'table {{{{.Names}}}}\t{{{{.Status}}}}\t{{{{.Ports}}}}'"
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        out = res.stdout.strip()
+        return out if out else "Không tìm thấy container Docker nào."
+    except Exception as e:
+        return f"Lỗi kiểm tra Docker: {e}"
+
+def get_docker_logs(container_name: str, lines: int = 30) -> str:
+    """Trích xuất số dòng log mới nhất của một container Docker cụ thể để chẩn đoán lỗi."""
+    safe_name = "".join(c for c in container_name if c.isalnum() or c in "-_")
+    if not safe_name:
+        return "Tên container không hợp lệ."
+    cmd = f"docker logs --tail {int(lines)} {safe_name}"
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        out = res.stdout if res.stdout else res.stderr
+        return out[-1500:] if out else f"Không có dữ liệu log cho container {safe_name}."
+    except Exception as e:
+        return f"Lỗi lấy log: {e}"
+
+def restart_docker_container(container_name: str) -> str:
+    """Khởi động lại một container Docker cụ thể theo tên dịch vụ."""
+    safe_name = "".join(c for c in container_name if c.isalnum() or c in "-_")
+    if not safe_name:
+        return "Tên container không hợp lệ."
+    cmd = f"docker restart {safe_name}"
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=25)
+        if res.returncode == 0:
+            return f"Đã khởi động lại thành công container {safe_name}."
+        return f"Khởi động lại thất bại: {res.stderr.strip()}"
+    except Exception as e:
+        return f"Lỗi khi thực thi khởi động container: {e}"
+
 def run_terminal_command(command: str) -> str:
-    """Thực thi các lệnh Linux tra cứu an toàn như docker ps, kiểm tra log dịch vụ hoặc đo kiểm mạng."""
+    """Thực thi các lệnh Linux tra cứu an toàn trên hệ thống."""
     danger_keywords = ["rm -rf", "mkfs", "dd ", "shutdown", "reboot", "> /etc", "> /boot"]
     if any(k in command for k in danger_keywords):
         return "Lệnh bị chặn do nguy cơ gây hại hệ thống."
@@ -124,7 +159,14 @@ def run_terminal_command(command: str) -> str:
     except Exception as e:
         return f"Lỗi chạy lệnh: {e}"
 
-TOOLS_LIST = [get_system_stats, get_top_processes, run_terminal_command]
+TOOLS_LIST = [
+    get_system_stats,
+    get_top_processes,
+    list_docker_containers,
+    get_docker_logs,
+    restart_docker_container,
+    run_terminal_command
+]
 
 def save_last_channel(channel_id):
     try:
@@ -157,7 +199,6 @@ async def ask_jarvis_agent(prompt: str) -> str:
     global active_chat_session, current_model_used
     errors = []
 
-    # Tạo phiên nếu chưa khởi tạo
     if active_chat_session is None:
         for model_name in MODELS_TO_TRY:
             try:
@@ -176,7 +217,6 @@ async def ask_jarvis_agent(prompt: str) -> str:
     if active_chat_session is None:
         return "⚠️ Không thể kết nối mô hình AI:\n" + "\n".join(errors[:2])
 
-    # Gửi tin nhắn tiếp nối vào mạch hội thoại hiện tại
     try:
         def _send():
             resp = active_chat_session.send_message(prompt)
@@ -184,7 +224,6 @@ async def ask_jarvis_agent(prompt: str) -> str:
 
         return await asyncio.to_thread(_send)
     except Exception as err:
-        # Nếu lỗi ngữ cảnh quá dài hoặc phiên bị ngắt, tự phục hồi bằng phiên mới
         active_chat_session = None
         return f"⚠️ Trục trặc phiên làm việc: {err}. Phiên đối thoại đã được đặt lại."
 
@@ -211,7 +250,6 @@ async def on_message(message):
         await message.reply("Pong! Hệ thống MacServerControl sẵn sàng phục vụ.")
         return
 
-    # Lệnh làm mới trí nhớ ngữ cảnh
     if content in ["reset", "làm mới", "quên hết đi", "new chat"]:
         active_chat_session = None
         await message.reply("🧠 Đã xóa sạch bộ nhớ đệm hội thoại. Bắt đầu phiên làm việc mới.")
