@@ -12,7 +12,9 @@ REPO_DIR = "/home/dongkhoi/mac-server"
 CHANNEL_CACHE_FILE = "/home/dongkhoi/.last_channel_id"
 SECRETS_FILE = "/home/dongkhoi/.secrets"
 MEDIA_DOWNLOAD_DIR = "/home/dongkhoi/Downloads/Media"
-MUSIC_DOWNLOAD_DIR = "/home/dongkhoi/Downloads/Music"
+MUSIC_DOWNLOAD_DIR = "/mnt/data/data/media/music"
+JELLYFIN_URL = "http://127.0.0.1:8096"
+JELLYFIN_API_KEY = "e0d6cdb1f3c04c84bb23bc77c07bf736"
 ALLOWED_USER_ID = 932202011812823070
 
 os.environ["PATH"] = f"/home/dongkhoi/.local/bin:{os.environ.get('PATH', '')}"
@@ -55,10 +57,11 @@ SYSTEM_INSTRUCTION = (
     "Bạn là trợ lý điều hành máy chủ MacServerControl tên là JARVIS. "
     "Bạn duy trì ngữ cảnh trò chuyện xuyên suốt nhiều lượt với sếp. "
     "Bạn sở hữu các công cụ tra cứu phần cứng, kiểm tra tiến trình, quản trị dịch vụ Docker, "
-    "tìm kiếm nhạc, tải nhạc MP3 chất lượng cao, tải video media và thực thi lệnh shell Linux an toàn. "
+    "tìm kiếm nhạc, tải nhạc trực tiếp vào thư viện Jellyfin, quét làm mới thư viện Jellyfin, tải video media và thực thi lệnh shell Linux an toàn. "
     "Khi sếp muốn tìm bài hát hoặc xem danh sách các bản nhạc/remix trước khi tải, hãy gọi công cụ search_music. "
     "Khi sếp gửi tên bài hát, yêu cầu tải nhạc (ví dụ: 'tải bài...', 'tải nhạc...', 'tìm và tải...') "
-    "hoặc gửi liên kết Spotify/YouTube/SoundCloud, hãy lập tức gọi công cụ download_music. "
+    "hoặc gửi liên kết Spotify/YouTube/SoundCloud, hãy lập tức gọi công cụ download_music. Nhạc tải về sẽ tự động đồng bộ ngay vào Jellyfin. "
+    "Khi sếp bảo quét lại Jellyfin, làm mới thư viện media (hoặc 'quét jellyfin', 'scan library'), hãy gọi refresh_jellyfin_library. "
     "Khi sếp gửi liên kết video media, hãy gọi download_media_video. "
     "Khi sếp gửi liên kết magnet torrent, hãy gọi add_magnet_link. "
     "Khi sếp hỏi thăm tiến độ tải (ví dụ: 'tiến độ sao rồi', 'kiểm tra tải xong chưa'), hãy gọi check_download_progress. "
@@ -194,18 +197,40 @@ def run_terminal_command(command: str) -> str:
     except Exception as e:
         return f"Lỗi chạy lệnh: {e}"
 
+def refresh_jellyfin_library() -> str:
+    """Kích hoạt quét và làm mới toàn bộ thư viện phim ảnh, âm nhạc trên Jellyfin máy chủ."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"{JELLYFIN_URL}/Library/Refresh",
+            data=b"",
+            headers={"X-Emby-Token": JELLYFIN_API_KEY},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            if resp.status in (200, 204):
+                return "✅ Đã kích hoạt quét làm mới thư viện Jellyfin thành công. Media mới sẽ xuất hiện ngay trên giao diện."
+            return f"Phản hồi từ Jellyfin: mã HTTP {resp.status}"
+    except Exception as e:
+        return f"Lỗi khi gửi yêu cầu quét Jellyfin: {e}"
+
 def download_music(query_or_url: str) -> str:
-    """Tải bài hát hoặc album về máy chủ. Nhận liên kết Spotify, YouTube, SoundCloud hoặc từ khóa/tên bài hát cần tìm (ví dụ: 'Lạc Trôi Sơn Tùng', 'Lỡ thương nhau bò sữa bay')."""
+    """Tải bài hát hoặc album về máy chủ và tự động đồng bộ vào thư viện Jellyfin. Nhận liên kết Spotify, YouTube, SoundCloud hoặc từ khóa/tên bài hát cần tìm (ví dụ: 'Lạc Trôi Sơn Tùng', 'Lỡ thương nhau bò sữa bay')."""
     target = query_or_url.strip()
     if not target:
         return "Vui lòng cung cấp tên bài hát hoặc liên kết hợp lệ."
 
+    refresh_hook = f"curl -s -X POST '{JELLYFIN_URL}/Library/Refresh' -H 'X-Emby-Token: {JELLYFIN_API_KEY}'"
+
     # Nếu là link Spotify
     if "open.spotify.com" in target:
         clean_url = target.split("?")[0].strip()
-        cmd = f"nohup spotdl --output '{MUSIC_DOWNLOAD_DIR}' '{clean_url}' > /tmp/music_download_last.log 2>&1 &"
+        cmd = (
+            f"nohup bash -c 'spotdl --output \"{MUSIC_DOWNLOAD_DIR}\" \"{clean_url}\" "
+            f"> /tmp/music_download_last.log 2>&1 && {refresh_hook}' > /dev/null 2>&1 &"
+        )
         subprocess.Popen(cmd, shell=True)
-        return f"Đã bắt đầu tải bài hát từ Spotify vào {MUSIC_DOWNLOAD_DIR}. Tiến trình đang chạy ngầm."
+        return f"Đã bắt đầu tải bài hát từ Spotify vào Jellyfin ({MUSIC_DOWNLOAD_DIR}). Khi hoàn tất, Jellyfin sẽ tự động quét và hiển thị bài hát."
 
     # Nếu là link YouTube/web hoặc từ khóa tên bài hát
     if target.startswith("http://") or target.startswith("https://"):
@@ -214,13 +239,13 @@ def download_music(query_or_url: str) -> str:
         search_target = f"ytsearch1:{target}"
 
     cmd = (
-        f"nohup yt-dlp -x --audio-format mp3 --audio-quality 0 "
+        f"nohup bash -c 'yt-dlp -x --audio-format mp3 --audio-quality 0 "
         f"--embed-thumbnail --add-metadata "
-        f"-o '{MUSIC_DOWNLOAD_DIR}/%(title)s.%(ext)s' '{search_target}' "
-        f"> /tmp/music_download_last.log 2>&1 &"
+        f"-o \"{MUSIC_DOWNLOAD_DIR}/%(title)s.%(ext)s\" \"{search_target}\" "
+        f"> /tmp/music_download_last.log 2>&1 && {refresh_hook}' > /dev/null 2>&1 &"
     )
     subprocess.Popen(cmd, shell=True)
-    return f"Đã bắt đầu tìm kiếm và tải bài hát '{target}' về {MUSIC_DOWNLOAD_DIR}. Tiến trình đang chạy ngầm."
+    return f"Đã bắt đầu tải bài hát '{target}' vào Jellyfin ({MUSIC_DOWNLOAD_DIR}). Khi tải xong, thư viện sẽ tự động làm mới ngay lập tức."
 
 def download_spotify_track(url: str) -> str:
     """Tải bài hát từ Spotify (tương thích ngược)."""
@@ -282,6 +307,7 @@ TOOLS_LIST = [
     list_docker_containers,
     get_docker_logs,
     restart_docker_container,
+    refresh_jellyfin_library,
     download_media_video,
     add_magnet_link,
     download_music,
