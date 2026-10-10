@@ -82,6 +82,7 @@ async def run_async_download_and_notify(cmd: str, target_name: str, channel_id: 
 
                 # Trích xuất metadata JSON từ log_file nếu do music_tagger tạo ra
                 meta_info = None
+                spot_info = None
                 if os.path.exists(log_file):
                     try:
                         with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -89,11 +90,29 @@ async def run_async_download_and_notify(cmd: str, target_name: str, channel_id: 
                             json_match = re.search(r'\{[\s\S]*"title"[\s\S]*\}', content)
                             if json_match:
                                 meta_info = json.loads(json_match.group(0))
+
+                            album_match = re.search(r'Found (\d+) songs in (.+?) \((Album|Playlist|Artist)\)', content)
+                            if album_match:
+                                d_count = len(re.findall(r'Downloaded "[^"]+"', content))
+                                spot_info = {
+                                    "total": album_match.group(1),
+                                    "name": album_match.group(2),
+                                    "type": album_match.group(3),
+                                    "count": d_count
+                                }
                     except Exception:
                         pass
 
                 if channel:
-                    if meta_info and meta_info.get("title") and meta_info.get("artist"):
+                    if spot_info:
+                        type_name = "ALBUM" if spot_info["type"].lower() == "album" else ("NGHỆ SĨ" if spot_info["type"].lower() == "artist" else "PLAYLIST")
+                        await channel.send(
+                            f"✅ **ĐÃ TẢI XONG TRỌN BỘ {type_name}:** `{spot_info['name']}`\n"
+                            f"💿 **Số lượng bài:** `{spot_info['count']}/{spot_info['total']} bài`\n"
+                            f"🎧 Đã tự động cập nhật vào **Jellyfin & Navidrome**.\n"
+                            f"Sếp mở **Ampsonic** trên iPhone là có thể thưởng thức trọn vẹn rồi ạ! 🎵"
+                        )
+                    elif meta_info and meta_info.get("title") and meta_info.get("artist"):
                         src_desc = meta_info.get("source", "Tự động nhận diện")
                         await channel.send(
                             f"✅ **ĐÃ TẢI XONG:** `{meta_info['title']}`\n"
@@ -151,8 +170,10 @@ SYSTEM_INSTRUCTION = (
     "Bạn duy trì ngữ cảnh trò chuyện xuyên suốt nhiều lượt với sếp. "
     "Bạn sở hữu các công cụ tra cứu phần cứng, kiểm tra tiến trình, quản trị dịch vụ Docker, "
     "tìm kiếm nhạc, tải nhạc/album/ca sĩ vào thư viện Jellyfin & Navidrome, làm mới thư viện và thực thi lệnh an toàn. "
-    "Khi sếp muốn tải cả Album (ví dụ: 'tải album 99% của MCK', 'tải album SKY DECADE'), hãy gọi download_music với tham số 'album: <tên album>' hoặc link Spotify album nếu có. "
-    "Khi sếp muốn tải tất cả bài của ca sĩ (ví dụ: 'tải nhạc ca sĩ Vũ', 'tải bài hát của Sơn Tùng'), hãy gọi download_music với tham số 'artist: <tên ca sĩ>' hoặc link Spotify artist nếu có. "
+    "Khi sếp muốn tải cả Album (ví dụ: 'tải album 99% của MCK', 'tải album Gieo', 'tải album Ng\'bth của Ngọt'): "
+    "  - Nếu sếp gửi link Spotify (hoặc bạn biết chính xác link Spotify album/playlist đó), hãy ưu tiên gọi download_music bằng chính liên kết Spotify đó (ví dụ https://open.spotify.com/album/...) để đảm bảo tải đúng 100% không bị lỗi tìm kiếm. "
+    "  - Nếu dùng cú pháp 'album: <tên album>', bạn chỉ được điền tên album chính xác trên Spotify và loại bỏ tên ca sĩ (ví dụ 'album: Gieo' thay vì 'album: Gieo Ngọt', hoặc 'album: Ng\'bthg' cho album Ng'bth). "
+    "Khi sếp muốn tải tất cả bài của ca sĩ (ví dụ: 'tải nhạc ca sĩ Vũ', 'tải bài hát của Sơn Tùng'), hãy gọi download_music với link Spotify artist nếu có hoặc 'artist: <tên ca sĩ chuẩn>'. "
     "Khi sếp gửi liên kết Spotify (bài hát, album, playlist, artist), hãy lập tức gọi công cụ download_music với link đó. "
     "Khi sếp gửi tên bài hát đơn lẻ, hãy gọi download_music với tên bài hát. "
     "Khi sếp muốn tìm bài hát hoặc xem danh sách các bản nhạc/remix trước khi tải, hãy gọi search_music. "
@@ -318,21 +339,48 @@ def download_music(query_or_url: str) -> str:
     if not target:
         return "Vui lòng cung cấp tên bài hát, album hoặc liên kết hợp lệ."
 
-    output_tpl = f"{MUSIC_DOWNLOAD_DIR}/{{artist}}/{{album}}/{{track-number}} - {{title}}.{{output-ext}}"
+    # Danh mục ánh xạ trực tiếp các album/nghệ sĩ phổ biến để tránh lỗi tìm kiếm không chính xác
+    KNOWN_ALBUM_URLS = {
+        "ng'bth": "https://open.spotify.com/album/4BwnV3YdCtxn8ydFVrstbI",
+        "ng'bthg": "https://open.spotify.com/album/4BwnV3YdCtxn8ydFVrstbI",
+        "nguoi binh thuong": "https://open.spotify.com/album/4BwnV3YdCtxn8ydFVrstbI",
+        "người bình thường": "https://open.spotify.com/album/4BwnV3YdCtxn8ydFVrstbI",
+        "gieo": "https://open.spotify.com/album/1ZnJrvDY8ih3ppPWR2Tc2a",
+        "gieo ngọt": "https://open.spotify.com/album/1ZnJrvDY8ih3ppPWR2Tc2a",
+        "gieo ngot": "https://open.spotify.com/album/1ZnJrvDY8ih3ppPWR2Tc2a",
+        "99%": "https://open.spotify.com/album/1vi1WySkgPGkbR8NnQzlXu",
+        "99% mck": "https://open.spotify.com/album/1vi1WySkgPGkbR8NnQzlXu",
+        "3": "https://open.spotify.com/album/1vWpL5qW4Jt3L64gQ0xMkJ",
+        "3 ngọt": "https://open.spotify.com/album/1vWpL5qW4Jt3L64gQ0xMkJ",
+        "3 ngot": "https://open.spotify.com/album/1vWpL5qW4Jt3L64gQ0xMkJ",
+    }
 
+    clean_target = target
     lower_target = target.lower()
-    is_spotify = "open.spotify.com" in target or any(lower_target.startswith(p) for p in ["album:", "artist:", "playlist:"])
+
+    # Kiểm tra ánh xạ nếu target chứa tên album đã biết
+    for alias, s_url in KNOWN_ALBUM_URLS.items():
+        if alias in lower_target:
+            if "album" in lower_target or not target.startswith("http"):
+                clean_target = s_url
+                lower_target = s_url.lower()
+                break
+
+    output_tpl = f"{MUSIC_DOWNLOAD_DIR}/{{artist}}/{{album}}/{{track-number}} - {{title}}.{{output-ext}}"
+    is_spotify = "open.spotify.com" in clean_target or any(lower_target.startswith(p) for p in ["album:", "artist:", "playlist:"])
 
     if is_spotify:
-        clean_target = target.split("?")[0].strip() if "open.spotify.com" in target else target
-        cmd = f"spotdl --output \"{output_tpl}\" \"{clean_target}\""
-        dispatch_download_task(cmd, clean_target, "/tmp/music_download_last.log", is_music=True)
-        if "album" in clean_target:
-            return f"Đã bắt đầu quét và tải trọn bộ Album '{clean_target}' về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi tải xong và đồng bộ vào Jellyfin & Navidrome."
-        elif "artist" in clean_target:
-            return f"Đã bắt đầu quét và tải các bài hát của Nghệ sĩ '{clean_target}' về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
-        elif "playlist" in clean_target:
-            return f"Đã bắt đầu tải toàn bộ Playlist '{clean_target}' về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
+        final_spotify_target = clean_target.split("?")[0].strip() if "open.spotify.com" in clean_target else clean_target
+        # Thoát dấu nháy để đảm bảo an toàn cho shell command
+        safe_spotify_target = final_spotify_target.replace('"', '\\"')
+        cmd = f"spotdl --output \"{output_tpl}\" \"{safe_spotify_target}\""
+        dispatch_download_task(cmd, final_spotify_target, "/tmp/music_download_last.log", is_music=True)
+        if "album" in final_spotify_target:
+            return f"Đã bắt đầu quét và tải trọn bộ Album '{final_spotify_target}' về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi tải xong và đồng bộ vào Jellyfin & Navidrome."
+        elif "artist" in final_spotify_target:
+            return f"Đã bắt đầu quét và tải các bài hát của Nghệ sĩ '{final_spotify_target}' về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
+        elif "playlist" in final_spotify_target:
+            return f"Đã bắt đầu tải toàn bộ Playlist '{final_spotify_target}' về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
         return f"Đã bắt đầu tải bài hát từ Spotify vào kho nhạc. Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
 
     # Nếu là link YouTube/web hoặc từ khóa bài hát đơn lẻ
