@@ -55,10 +55,13 @@ SYSTEM_INSTRUCTION = (
     "Bạn là trợ lý điều hành máy chủ MacServerControl tên là JARVIS. "
     "Bạn duy trì ngữ cảnh trò chuyện xuyên suốt nhiều lượt với sếp. "
     "Bạn sở hữu các công cụ tra cứu phần cứng, kiểm tra tiến trình, quản trị dịch vụ Docker, "
-    "tải video media bằng yt-dlp và thực thi lệnh shell Linux an toàn. "
-    "Khi chủ nhân gửi link video, link magnet hoặc yêu cầu tải phim ảnh nhạc về máy chủ, "
-    "hãy lập tức gọi công cụ download tương ứng và phản hồi trạng thái một cách mạch lạc."
-     "Khi chủ nhân gửi liên kết Spotify, hãy gọi ngay công cụ download_spotify_track. "
+    "tìm kiếm nhạc, tải nhạc MP3 chất lượng cao, tải video media và thực thi lệnh shell Linux an toàn. "
+    "Khi sếp muốn tìm bài hát hoặc xem danh sách các bản nhạc/remix trước khi tải, hãy gọi công cụ search_music. "
+    "Khi sếp gửi tên bài hát, yêu cầu tải nhạc (ví dụ: 'tải bài...', 'tải nhạc...', 'tìm và tải...') "
+    "hoặc gửi liên kết Spotify/YouTube/SoundCloud, hãy lập tức gọi công cụ download_music. "
+    "Khi sếp gửi liên kết video media, hãy gọi download_media_video. "
+    "Khi sếp gửi liên kết magnet torrent, hãy gọi add_magnet_link. "
+    "Khi sếp hỏi thăm tiến độ tải (ví dụ: 'tiến độ sao rồi', 'kiểm tra tải xong chưa'), hãy gọi check_download_progress. "
     "Tuyệt đối không tự ghép lệnh terminal phức tạp khi đã có công cụ sẵn."
 )
 
@@ -191,15 +194,87 @@ def run_terminal_command(command: str) -> str:
     except Exception as e:
         return f"Lỗi chạy lệnh: {e}"
 
-def download_spotify_track(url: str) -> str:
-    """Tải bài hát hoặc album từ liên kết Spotify về thư mục Music trên máy chủ."""
-    if "open.spotify.com" not in url:
-        return "Đường dẫn không phải là liên kết Spotify hợp lệ."
-    
-    clean_url = url.split("?")[0].strip()
-    cmd = f"nohup spotdl --output '{MUSIC_DOWNLOAD_DIR}' '{clean_url}' > /tmp/spotdl_last.log 2>&1 &"
+def download_music(query_or_url: str) -> str:
+    """Tải bài hát hoặc album về máy chủ. Nhận liên kết Spotify, YouTube, SoundCloud hoặc từ khóa/tên bài hát cần tìm (ví dụ: 'Lạc Trôi Sơn Tùng', 'Lỡ thương nhau bò sữa bay')."""
+    target = query_or_url.strip()
+    if not target:
+        return "Vui lòng cung cấp tên bài hát hoặc liên kết hợp lệ."
+
+    # Nếu là link Spotify
+    if "open.spotify.com" in target:
+        clean_url = target.split("?")[0].strip()
+        cmd = f"nohup spotdl --output '{MUSIC_DOWNLOAD_DIR}' '{clean_url}' > /tmp/music_download_last.log 2>&1 &"
+        subprocess.Popen(cmd, shell=True)
+        return f"Đã bắt đầu tải bài hát từ Spotify vào {MUSIC_DOWNLOAD_DIR}. Tiến trình đang chạy ngầm."
+
+    # Nếu là link YouTube/web hoặc từ khóa tên bài hát
+    if target.startswith("http://") or target.startswith("https://"):
+        search_target = target
+    else:
+        search_target = f"ytsearch1:{target}"
+
+    cmd = (
+        f"nohup yt-dlp -x --audio-format mp3 --audio-quality 0 "
+        f"--embed-thumbnail --add-metadata "
+        f"-o '{MUSIC_DOWNLOAD_DIR}/%(title)s.%(ext)s' '{search_target}' "
+        f"> /tmp/music_download_last.log 2>&1 &"
+    )
     subprocess.Popen(cmd, shell=True)
-    return f"Đã bắt đầu tải bài hát ngầm vào thư mục {MUSIC_DOWNLOAD_DIR}. Nhật ký tải đang ghi tại /tmp/spotdl_last.log."
+    return f"Đã bắt đầu tìm kiếm và tải bài hát '{target}' về {MUSIC_DOWNLOAD_DIR}. Tiến trình đang chạy ngầm."
+
+def download_spotify_track(url: str) -> str:
+    """Tải bài hát từ Spotify (tương thích ngược)."""
+    return download_music(url)
+
+def search_music(query: str, limit: int = 5) -> str:
+    """Tìm kiếm danh sách bài hát trên mạng theo tên bài hát hoặc ca sĩ (trả về danh sách tên, ca sĩ, thời lượng, URL)."""
+    clean_query = query.strip()
+    if not clean_query:
+        return "Vui lòng nhập từ khóa tìm kiếm."
+    max_results = min(max(int(limit), 1), 8)
+    cmd = (
+        f"yt-dlp --flat-playlist --print '%(title)s | %(uploader)s | %(duration_string)s | %(url)s' "
+        f"'ytsearch{max_results}:{clean_query}'"
+    )
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+        lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
+        if not lines:
+            return f"Không tìm thấy bài hát nào phù hợp với từ khóa '{clean_query}'."
+        
+        results = [f"🔍 **Kết quả tìm kiếm cho '{clean_query}':**"]
+        for idx, line in enumerate(lines, 1):
+            parts = line.split(" | ")
+            if len(parts) >= 4:
+                title, uploader, duration, url = parts[0], parts[1], parts[2], parts[3]
+                results.append(f"{idx}. **{title}**\n   - Kênh: {uploader} | Thời lượng: {duration}\n   - Link: <{url}>")
+            else:
+                results.append(f"{idx}. {line}")
+        return "\n".join(results)
+    except Exception as e:
+        return f"Lỗi tìm kiếm: {e}"
+
+def check_download_progress() -> str:
+    """Kiểm tra tiến độ tải nhạc hoặc video media gần nhất trên máy chủ."""
+    logs_to_check = [
+        ("Tiến trình Tải Nhạc", "/tmp/music_download_last.log"),
+        ("Tiến trình Spotify", "/tmp/spotdl_last.log"),
+        ("Tiến trình Media Video", "/tmp/ytdlp_last.log")
+    ]
+    reports = []
+    for label, log_path in logs_to_check:
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = [line.strip() for line in f.readlines() if line.strip()]
+                    if lines:
+                        last_lines = "\n".join(lines[-4:])
+                        reports.append(f"📌 **{label}:**\n```text\n{last_lines}\n```")
+            except Exception:
+                pass
+    if not reports:
+        return "Hiện chưa có tiến trình tải nào ghi nhận nhật ký gần đây."
+    return "\n\n".join(reports)
 
 TOOLS_LIST = [
     get_system_stats,
@@ -209,7 +284,10 @@ TOOLS_LIST = [
     restart_docker_container,
     download_media_video,
     add_magnet_link,
+    download_music,
     download_spotify_track,
+    search_music,
+    check_download_progress,
     run_terminal_command
 ]
 
