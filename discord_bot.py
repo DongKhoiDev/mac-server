@@ -1,5 +1,7 @@
 import os
 import sys
+import re
+import json
 import psutil
 import asyncio
 import subprocess
@@ -77,12 +79,36 @@ async def run_async_download_and_notify(cmd: str, target_name: str, channel_id: 
                     refresh_jellyfin_library()
                 except Exception:
                     pass
+
+                # Trích xuất metadata JSON từ log_file nếu do music_tagger tạo ra
+                meta_info = None
+                if os.path.exists(log_file):
+                    try:
+                        with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read()
+                            json_match = re.search(r'\{[\s\S]*"title"[\s\S]*\}', content)
+                            if json_match:
+                                meta_info = json.loads(json_match.group(0))
+                    except Exception:
+                        pass
+
                 if channel:
-                    await channel.send(
-                        f"✅ **ĐÃ TẢI XONG:** `{target_name}`\n"
-                        f"🎧 Đã tự động cập nhật vào **Jellyfin & Navidrome**.\n"
-                        f"Sếp mở **Ampsonic** trên iPhone là có thể thưởng thức ngay rồi ạ! 🎵"
-                    )
+                    if meta_info and meta_info.get("title") and meta_info.get("artist"):
+                        src_desc = meta_info.get("source", "Tự động nhận diện")
+                        await channel.send(
+                            f"✅ **ĐÃ TẢI XONG:** `{meta_info['title']}`\n"
+                            f"👤 **Ca sĩ:** `{meta_info['artist']}`\n"
+                            f"💿 **Album:** `{meta_info.get('album', 'Single')}`\n"
+                            f"🔍 **Phương thức nhận diện:** `{src_desc}`\n"
+                            f"🎧 Đã tự động cập nhật vào **Jellyfin & Navidrome**.\n"
+                            f"Sếp mở **Ampsonic** trên iPhone là có thể thưởng thức ngay rồi ạ! 🎵"
+                        )
+                    else:
+                        await channel.send(
+                            f"✅ **ĐÃ TẢI XONG:** `{target_name}`\n"
+                            f"🎧 Đã tự động cập nhật vào **Jellyfin & Navidrome**.\n"
+                            f"Sếp mở **Ampsonic** trên iPhone là có thể thưởng thức ngay rồi ạ! 🎵"
+                        )
             else:
                 if channel:
                     await channel.send(
@@ -231,7 +257,7 @@ def download_media_video(url: str, subfolder: str = "") -> str:
     os.makedirs(target_dir, exist_ok=True)
     
     cmd = (
-        f"yt-dlp -f 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' "
+        f"yt-dlp --js-runtimes node -f 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' "
         f"--no-playlist -o '{target_dir}/%(title)s.%(ext)s' '{url}'"
     )
     dispatch_download_task(cmd, url, "/tmp/ytdlp_last.log", is_music=False)
@@ -310,18 +336,10 @@ def download_music(query_or_url: str) -> str:
         return f"Đã bắt đầu tải bài hát từ Spotify vào kho nhạc. Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
 
     # Nếu là link YouTube/web hoặc từ khóa bài hát đơn lẻ
-    if target.startswith("http://") or target.startswith("https://"):
-        search_target = target
-    else:
-        search_target = f"ytsearch1:{target}"
-
-    cmd = (
-        f"yt-dlp -x --audio-format mp3 --audio-quality 0 "
-        f"--embed-thumbnail --add-metadata "
-        f"-o \"{MUSIC_DOWNLOAD_DIR}/%(artist,uploader)s/%(album,title)s/%(playlist_index,track_number,1)02d - %(title)s.%(ext)s\" \"{search_target}\""
-    )
+    safe_target = target.replace('"', '\\"')
+    cmd = f"python3 {REPO_DIR}/music_tagger.py --download \"{safe_target}\" --hint \"{safe_target}\""
     dispatch_download_task(cmd, target, "/tmp/music_download_last.log", is_music=True)
-    return f"Đã bắt đầu tải bài hát '{target}' vào kho nhạc ({MUSIC_DOWNLOAD_DIR}). Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
+    return f"Đã bắt đầu tải bài hát '{target}'. Hệ thống sẽ tự động nhận diện metadata chuẩn bằng vân tay âm thanh (AcoustID / iTunes) với cơ chế fallback bộ lọc regex, gắn ảnh bìa và sắp xếp vào đúng thư viện của Jellyfin & Navidrome."
 
 def download_spotify_track(url: str) -> str:
     """Tải bài hát hoặc album từ Spotify (tương thích ngược)."""
@@ -334,7 +352,7 @@ def search_music(query: str, limit: int = 5) -> str:
         return "Vui lòng nhập từ khóa tìm kiếm."
     max_results = min(max(int(limit), 1), 8)
     cmd = (
-        f"yt-dlp --flat-playlist --print '%(title)s | %(uploader)s | %(duration_string)s | %(url)s' "
+        f"yt-dlp --js-runtimes node --flat-playlist --print '%(title)s | %(uploader)s | %(duration_string)s | %(url)s' "
         f"'ytsearch{max_results}:{clean_query}'"
     )
     try:
