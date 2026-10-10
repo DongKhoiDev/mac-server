@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 import discord
 from discord.ext import tasks, commands
 import google.generativeai as genai
+from difflib import SequenceMatcher
+from typing import Optional, Dict, Any, List, Tuple
 
 REPO_DIR = "/home/dongkhoi/mac-server"
 CHANNEL_CACHE_FILE = "/home/dongkhoi/.last_channel_id"
@@ -329,6 +331,116 @@ def refresh_jellyfin_library() -> str:
     except Exception as e:
         return f"Lỗi khi gửi yêu cầu quét Jellyfin: {e}"
 
+def get_spotify_client():
+    try:
+        from spotdl.utils.spotify import SpotifyClient
+        if not SpotifyClient.get_instance():
+            SpotifyClient.init(
+                client_id="5f573c9620494bae87890c0f08a60293",
+                client_secret="212476d9b0f3472eaa762d90b19b0ba8"
+            )
+        return SpotifyClient()
+    except Exception as e:
+        print(f"Lỗi khởi tạo SpotifyClient: {e}", flush=True)
+    return None
+
+def find_album_url_by_search(query: str) -> Optional[str]:
+    """Tự động tra cứu link Spotify Album chính xác từ tên album text để khắc phục triệt để lỗi SongListError của spotdl."""
+    client = get_spotify_client()
+    if not client:
+        return None
+
+    clean_q = re.sub(r'^(album|tải album):\s*', '', query.strip(), flags=re.IGNORECASE)
+    clean_q = re.sub(r'\s+(của|by)\s+.+$', '', clean_q, flags=re.IGNORECASE).strip()
+
+    candidates = [clean_q]
+    if query != clean_q and query not in candidates:
+        candidates.append(query)
+
+    found_albums = {}
+    for cq in candidates:
+        try:
+            res = client.search(cq)
+            tracks = res.get("tracks", {}).get("items", []) if res else []
+            for t in tracks:
+                alb = t.get("album")
+                if alb and alb.get("id"):
+                    alb_id = alb["id"]
+                    alb_name = alb.get("name", "")
+                    alb_artists = [a.get("name", "") for a in alb.get("artists", [])]
+                    if alb_id not in found_albums:
+                        found_albums[alb_id] = {
+                            "name": alb_name,
+                            "artists": alb_artists,
+                            "url": f"https://open.spotify.com/album/{alb_id}"
+                        }
+        except Exception:
+            pass
+
+    if not found_albums:
+        return None
+
+    target_lower = clean_q.lower()
+    best_id = None
+    best_score = -1.0
+
+    for alb_id, data in found_albums.items():
+        name_lower = data["name"].lower()
+        score = SequenceMatcher(None, target_lower, name_lower).ratio()
+
+        if name_lower == target_lower:
+            score += 1.0
+        elif target_lower in name_lower:
+            score += 0.5
+
+        for art in data["artists"]:
+            if art.lower() in query.lower():
+                score += 0.4
+
+        if score > best_score:
+            best_score = score
+            best_id = alb_id
+
+    if best_id and best_score >= 0.4:
+        return found_albums[best_id]["url"]
+
+    return None
+
+def find_artist_url_by_search(query: str) -> Optional[str]:
+    """Tự động tra cứu link Spotify Artist chính xác từ tên ca sĩ text."""
+    client = get_spotify_client()
+    if not client:
+        return None
+
+    clean_q = re.sub(r'^(artist|ca sĩ|nghệ sĩ):\s*', '', query.strip(), flags=re.IGNORECASE)
+    try:
+        res = client.search(clean_q)
+        tracks = res.get("tracks", {}).get("items", []) if res else []
+        found_artists = {}
+        for t in tracks:
+            for a in t.get("artists", []):
+                a_id = a.get("id")
+                a_name = a.get("name")
+                if a_id and a_name not in found_artists:
+                    found_artists[a_name] = a_id
+
+        best_id = None
+        best_score = -1.0
+        target_lower = clean_q.lower()
+        for name, a_id in found_artists.items():
+            score = SequenceMatcher(None, target_lower, name.lower()).ratio()
+            if name.lower() == target_lower:
+                score += 1.0
+            if score > best_score:
+                best_score = score
+                best_id = a_id
+
+        if best_id and best_score >= 0.5:
+            return f"https://open.spotify.com/artist/{best_id}"
+    except Exception:
+        pass
+    return None
+
 def download_music(query_or_url: str) -> str:
     """Tải bài hát, album, ca sĩ hoặc playlist về máy chủ và tự động đồng bộ vào Jellyfin & Navidrome.
     Tham số có thể là:
@@ -341,6 +453,8 @@ def download_music(query_or_url: str) -> str:
 
     # Danh mục ánh xạ trực tiếp các album/nghệ sĩ phổ biến để tránh lỗi tìm kiếm không chính xác
     KNOWN_ALBUM_URLS = {
+        "ái": "https://open.spotify.com/album/5zyztYlsHoAeQKCsu8rVbo",
+        "ai": "https://open.spotify.com/album/5zyztYlsHoAeQKCsu8rVbo",
         "ng'bth": "https://open.spotify.com/album/4BwnV3YdCtxn8ydFVrstbI",
         "ng'bthg": "https://open.spotify.com/album/4BwnV3YdCtxn8ydFVrstbI",
         "nguoi binh thuong": "https://open.spotify.com/album/4BwnV3YdCtxn8ydFVrstbI",
@@ -358,7 +472,7 @@ def download_music(query_or_url: str) -> str:
     clean_target = target
     lower_target = target.lower()
 
-    # Kiểm tra ánh xạ nếu target chứa tên album đã biết
+    # 1. Kiểm tra ánh xạ nhanh
     for alias, s_url in KNOWN_ALBUM_URLS.items():
         if alias in lower_target:
             if "album" in lower_target or not target.startswith("http"):
@@ -366,19 +480,33 @@ def download_music(query_or_url: str) -> str:
                 lower_target = s_url.lower()
                 break
 
+    # 2. Tự động tìm Spotify URL cho Album nếu là tìm kiếm text (giải quyết triệt để SongListError)
+    if "open.spotify.com" not in clean_target and any(lower_target.startswith(p) for p in ["album:", "tải album"]):
+        resolved_album = find_album_url_by_search(clean_target)
+        if resolved_album:
+            clean_target = resolved_album
+            lower_target = resolved_album.lower()
+
+    # 3. Tự động tìm Spotify URL cho Artist nếu là tìm kiếm text
+    if "open.spotify.com" not in clean_target and any(lower_target.startswith(p) for p in ["artist:", "ca sĩ:", "nghệ sĩ:"]):
+        resolved_artist = find_artist_url_by_search(clean_target)
+        if resolved_artist:
+            clean_target = resolved_artist
+            lower_target = resolved_artist.lower()
+
     output_tpl = f"{MUSIC_DOWNLOAD_DIR}/{{artist}}/{{album}}/{{track-number}} - {{title}}.{{output-ext}}"
     is_spotify = "open.spotify.com" in clean_target or any(lower_target.startswith(p) for p in ["album:", "artist:", "playlist:"])
 
     if is_spotify:
         final_spotify_target = clean_target.split("?")[0].strip() if "open.spotify.com" in clean_target else clean_target
-        # Thoát dấu nháy để đảm bảo an toàn cho shell command
+        # Thoát dấu nháy để đảm bảo an toàn cho shell command, thêm --dont-filter-results để tránh lọc mất interlude/visualizer
         safe_spotify_target = final_spotify_target.replace('"', '\\"')
-        cmd = f"spotdl --output \"{output_tpl}\" \"{safe_spotify_target}\""
+        cmd = f"spotdl --output \"{output_tpl}\" --dont-filter-results \"{safe_spotify_target}\""
         dispatch_download_task(cmd, final_spotify_target, "/tmp/music_download_last.log", is_music=True)
         if "album" in final_spotify_target:
-            return f"Đã bắt đầu quét và tải trọn bộ Album '{final_spotify_target}' về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi tải xong và đồng bộ vào Jellyfin & Navidrome."
+            return f"Đã tìm thấy Album và bắt đầu tải trọn bộ từ Spotify ('{final_spotify_target}') về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi tải xong và đồng bộ vào Jellyfin & Navidrome."
         elif "artist" in final_spotify_target:
-            return f"Đã bắt đầu quét và tải các bài hát của Nghệ sĩ '{final_spotify_target}' về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
+            return f"Đã tìm thấy Nghệ sĩ và bắt đầu tải trọn bộ bài hát từ Spotify ('{final_spotify_target}') về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
         elif "playlist" in final_spotify_target:
             return f"Đã bắt đầu tải toàn bộ Playlist '{final_spotify_target}' về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
         return f"Đã bắt đầu tải bài hát từ Spotify vào kho nhạc. Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
