@@ -51,17 +51,35 @@ SYSTEM_INSTRUCTION = (
 )
 
 def get_system_stats() -> str:
-    """Tra cứu các chỉ số phần cứng hiện tại gồm CPU, RAM, dung lượng phân vùng ổ cứng và thời gian hoạt động."""
+    """Tra cứu các chỉ số phần cứng hiện tại gồm CPU, RAM, dung lượng tất cả các ổ đĩa và thời gian hoạt động."""
     cpu = psutil.cpu_percent(interval=1)
     ram = psutil.virtual_memory()
-    disk = psutil.disk_usage("/")
     boot_time = datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S")
+
+    # Quét tất cả các ổ đĩa và phân vùng thực tế
+    disk_lines = []
+    seen_mounts = set()
+    for part in psutil.disk_partitions(all=False):
+        if part.mountpoint in seen_mounts or "loop" in part.device:
+            continue
+        seen_mounts.add(part.mountpoint)
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+            total_gb = usage.total // (1024**3)
+            free_gb = usage.free // (1024**3)
+            disk_lines.append(f"  + {part.mountpoint} ({part.device}): Trống {free_gb} GB trên tổng {total_gb} GB, đã dùng {usage.percent}%")
+        except PermissionError:
+            continue
+
+    disk_info = "\n".join(disk_lines) if disk_lines else "Không đọc được ổ đĩa."
+
     return (
         f"CPU: {cpu}%\n"
-        f"RAM: {ram.percent}% - Dùng {ram.used // (1024**2)}MB trên tổng {ram.total // (1024**2)}MB\n"
-        f"Ổ cứng: {disk.percent}% - Trống {disk.free // (1024**3)}GB\n"
+        f"RAM: {ram.percent}% - Dùng {ram.used // (1024**2)} MB trên tổng {ram.total // (1024**2)} MB\n"
+        f"Dung lượng các ổ đĩa:\n{disk_info}\n"
         f"Thời gian hoạt động từ: {boot_time}"
     )
+
 
 def get_top_processes(sort_by: str = "memory", limit: int = 10) -> str:
     """Tra cứu danh sách các tiến trình chiếm dụng nhiều tài nguyên nhất. sort_by có thể là memory hoặc cpu."""
