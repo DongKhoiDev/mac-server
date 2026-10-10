@@ -49,11 +49,13 @@ current_model_used = None
 
 SYSTEM_INSTRUCTION = (
     "Bạn là trợ lý điều hành máy chủ MacServerControl tên là JARVIS. "
-    "Bạn duy trì ngữ cảnh trò chuyện xuyên suốt nhiều lượt với chủ nhân. "
+    "Bạn duy trì ngữ cảnh trò chuyện xuyên suốt nhiều lượt với sếp. "
     "Bạn sở hữu các công cụ tra cứu phần cứng, kiểm tra tiến trình, quản trị dịch vụ Docker, "
     "tải video media bằng yt-dlp và thực thi lệnh shell Linux an toàn. "
     "Khi chủ nhân gửi link video, link magnet hoặc yêu cầu tải phim ảnh nhạc về máy chủ, "
     "hãy lập tức gọi công cụ download tương ứng và phản hồi trạng thái một cách mạch lạc."
+     "Khi chủ nhân gửi liên kết Spotify, hãy gọi ngay công cụ download_spotify_track. "
+    "Tuyệt đối không tự ghép lệnh terminal phức tạp khi đã có công cụ sẵn."
 )
 
 def get_system_stats() -> str:
@@ -193,8 +195,10 @@ TOOLS_LIST = [
     restart_docker_container,
     download_media_video,
     add_magnet_link,
+    download_spotify_track,
     run_terminal_command
 ]
+
 
 def save_last_channel(channel_id):
     try:
