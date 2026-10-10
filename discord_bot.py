@@ -12,9 +12,13 @@ REPO_DIR = "/home/dongkhoi/mac-server"
 CHANNEL_CACHE_FILE = "/home/dongkhoi/.last_channel_id"
 SECRETS_FILE = "/home/dongkhoi/.secrets"
 MEDIA_DOWNLOAD_DIR = "/home/dongkhoi/Downloads/Media"
+MUSIC_DOWNLOAD_DIR = "/home/dongkhoi/Downloads/Music"
 ALLOWED_USER_ID = 932202011812823070
 
+os.environ["PATH"] = f"/home/dongkhoi/.local/bin:{os.environ.get('PATH', '')}"
+
 os.makedirs(MEDIA_DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(MUSIC_DOWNLOAD_DIR, exist_ok=True)
 
 DISCORD_TOKEN = ""
 GEMINI_API_KEY = ""
@@ -186,6 +190,16 @@ def run_terminal_command(command: str) -> str:
         return out[:1500] if out else "Lệnh hoàn tất không có output."
     except Exception as e:
         return f"Lỗi chạy lệnh: {e}"
+
+def download_spotify_track(url: str) -> str:
+    """Tải bài hát hoặc album từ liên kết Spotify về thư mục Music trên máy chủ."""
+    if "open.spotify.com" not in url:
+        return "Đường dẫn không phải là liên kết Spotify hợp lệ."
+    
+    clean_url = url.split("?")[0].strip()
+    cmd = f"nohup spotdl --output '{MUSIC_DOWNLOAD_DIR}' '{clean_url}' > /tmp/spotdl_last.log 2>&1 &"
+    subprocess.Popen(cmd, shell=True)
+    return f"Đã bắt đầu tải bài hát ngầm vào thư mục {MUSIC_DOWNLOAD_DIR}. Nhật ký tải đang ghi tại /tmp/spotdl_last.log."
 
 TOOLS_LIST = [
     get_system_stats,
@@ -380,19 +394,6 @@ async def monitor_health():
                         pass
     else:
         is_alert_active = False
-
-MUSIC_DOWNLOAD_DIR = "/home/dongkhoi/Downloads/Music"
-
-def download_spotify_track(url: str) -> str:
-    """Tải bài hát hoặc album từ liên kết Spotify về thư mục Music trên máy chủ."""
-    if "open.spotify.com" not in url:
-        return "Đường dẫn không phải là liên kết Spotify hợp lệ."
-    
-    clean_url = url.split("?")[0].strip()
-    cmd = f"nohup spotdl --output '{MUSIC_DOWNLOAD_DIR}' '{clean_url}' > /tmp/spotdl_last.log 2>&1 &"
-    subprocess.Popen(cmd, shell=True)
-    return f"Đã bắt đầu tải bài hát ngầm vào thư mục {MUSIC_DOWNLOAD_DIR}. Nhật ký tải đang ghi tại /tmp/spotdl_last.log."
-
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
