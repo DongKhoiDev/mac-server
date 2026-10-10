@@ -377,6 +377,19 @@ async def monitor_health():
     else:
         is_alert_active = False
 
+MUSIC_DOWNLOAD_DIR = "/home/dongkhoi/Downloads/Music"
+
+def download_spotify_track(url: str) -> str:
+    """Tải bài hát hoặc album từ liên kết Spotify về thư mục Music trên máy chủ."""
+    if "open.spotify.com" not in url:
+        return "Đường dẫn không phải là liên kết Spotify hợp lệ."
+    
+    clean_url = url.split("?")[0].strip()
+    cmd = f"nohup spotdl --output '{MUSIC_DOWNLOAD_DIR}' '{clean_url}' > /tmp/spotdl_last.log 2>&1 &"
+    subprocess.Popen(cmd, shell=True)
+    return f"Đã bắt đầu tải bài hát ngầm vào thư mục {MUSIC_DOWNLOAD_DIR}. Nhật ký tải đang ghi tại /tmp/spotdl_last.log."
+
+
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         print("Chưa cấu hình DISCORD_TOKEN trong /home/dongkhoi/.secrets")
