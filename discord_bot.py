@@ -57,14 +57,16 @@ SYSTEM_INSTRUCTION = (
     "Bạn là trợ lý điều hành máy chủ MacServerControl tên là JARVIS. "
     "Bạn duy trì ngữ cảnh trò chuyện xuyên suốt nhiều lượt với sếp. "
     "Bạn sở hữu các công cụ tra cứu phần cứng, kiểm tra tiến trình, quản trị dịch vụ Docker, "
-    "tìm kiếm nhạc, tải nhạc trực tiếp vào thư viện Jellyfin, quét làm mới thư viện Jellyfin, tải video media và thực thi lệnh shell Linux an toàn. "
-    "Khi sếp muốn tìm bài hát hoặc xem danh sách các bản nhạc/remix trước khi tải, hãy gọi công cụ search_music. "
-    "Khi sếp gửi tên bài hát, yêu cầu tải nhạc (ví dụ: 'tải bài...', 'tải nhạc...', 'tìm và tải...') "
-    "hoặc gửi liên kết Spotify/YouTube/SoundCloud, hãy lập tức gọi công cụ download_music. Nhạc tải về sẽ tự động đồng bộ ngay vào Jellyfin. "
-    "Khi sếp bảo quét lại Jellyfin, làm mới thư viện media (hoặc 'quét jellyfin', 'scan library'), hãy gọi refresh_jellyfin_library. "
+    "tìm kiếm nhạc, tải nhạc/album/ca sĩ vào thư viện Jellyfin & Navidrome, làm mới thư viện và thực thi lệnh an toàn. "
+    "Khi sếp muốn tải cả Album (ví dụ: 'tải album 99% của MCK', 'tải album SKY DECADE'), hãy gọi download_music với tham số 'album: <tên album>' hoặc link Spotify album nếu có. "
+    "Khi sếp muốn tải tất cả bài của ca sĩ (ví dụ: 'tải nhạc ca sĩ Vũ', 'tải bài hát của Sơn Tùng'), hãy gọi download_music với tham số 'artist: <tên ca sĩ>' hoặc link Spotify artist nếu có. "
+    "Khi sếp gửi liên kết Spotify (bài hát, album, playlist, artist), hãy lập tức gọi công cụ download_music với link đó. "
+    "Khi sếp gửi tên bài hát đơn lẻ, hãy gọi download_music với tên bài hát. "
+    "Khi sếp muốn tìm bài hát hoặc xem danh sách các bản nhạc/remix trước khi tải, hãy gọi search_music. "
+    "Khi sếp bảo quét lại Jellyfin, hãy gọi refresh_jellyfin_library. "
     "Khi sếp gửi liên kết video media, hãy gọi download_media_video. "
     "Khi sếp gửi liên kết magnet torrent, hãy gọi add_magnet_link. "
-    "Khi sếp hỏi thăm tiến độ tải (ví dụ: 'tiến độ sao rồi', 'kiểm tra tải xong chưa'), hãy gọi check_download_progress. "
+    "Khi sếp hỏi thăm tiến độ tải, hãy gọi check_download_progress. "
     "Tuyệt đối không tự ghép lệnh terminal phức tạp khi đã có công cụ sẵn."
 )
 
@@ -215,24 +217,37 @@ def refresh_jellyfin_library() -> str:
         return f"Lỗi khi gửi yêu cầu quét Jellyfin: {e}"
 
 def download_music(query_or_url: str) -> str:
-    """Tải bài hát hoặc album về máy chủ và tự động đồng bộ vào thư viện Jellyfin. Nhận liên kết Spotify, YouTube, SoundCloud hoặc từ khóa/tên bài hát cần tìm (ví dụ: 'Lạc Trôi Sơn Tùng', 'Lỡ thương nhau bò sữa bay')."""
+    """Tải bài hát, album, ca sĩ hoặc playlist về máy chủ và tự động đồng bộ vào Jellyfin & Navidrome.
+    Tham số có thể là:
+    - Liên kết Spotify: bài hát (/track/), album (/album/), ca sĩ (/artist/), playlist (/playlist/).
+    - Cú pháp tìm kiếm album hoặc ca sĩ: 'album: tên album' hoặc 'artist: tên ca sĩ'.
+    - Tên bài hát đơn lẻ hoặc liên kết YouTube."""
     target = query_or_url.strip()
     if not target:
-        return "Vui lòng cung cấp tên bài hát hoặc liên kết hợp lệ."
+        return "Vui lòng cung cấp tên bài hát, album hoặc liên kết hợp lệ."
 
     refresh_hook = f"curl -s -X POST '{JELLYFIN_URL}/Library/Refresh' -H 'X-Emby-Token: {JELLYFIN_API_KEY}'"
+    output_tpl = f"{MUSIC_DOWNLOAD_DIR}/{{artist}}/{{album}}/{{track-number}} - {{title}}.{{output-ext}}"
 
-    # Nếu là link Spotify
-    if "open.spotify.com" in target:
-        clean_url = target.split("?")[0].strip()
+    lower_target = target.lower()
+    is_spotify = "open.spotify.com" in target or any(lower_target.startswith(p) for p in ["album:", "artist:", "playlist:"])
+
+    if is_spotify:
+        clean_target = target.split("?")[0].strip() if "open.spotify.com" in target else target
         cmd = (
-            f"nohup bash -c 'spotdl --output \"{MUSIC_DOWNLOAD_DIR}\" \"{clean_url}\" "
+            f"nohup bash -c 'spotdl --output \"{output_tpl}\" \"{clean_target}\" "
             f"> /tmp/music_download_last.log 2>&1 && {refresh_hook}' > /dev/null 2>&1 &"
         )
         subprocess.Popen(cmd, shell=True)
-        return f"Đã bắt đầu tải bài hát từ Spotify vào Jellyfin ({MUSIC_DOWNLOAD_DIR}). Khi hoàn tất, Jellyfin sẽ tự động quét và hiển thị bài hát."
+        if "album" in clean_target:
+            return f"Đã bắt đầu quét và tải trọn bộ Album '{clean_target}' về kho nhạc máy chủ. Jellyfin và Navidrome sẽ tự động cập nhật khi hoàn tất."
+        elif "artist" in clean_target:
+            return f"Đã bắt đầu quét và tải các bài hát của Nghệ sĩ '{clean_target}' về kho nhạc máy chủ. Thư viện sẽ tự động cập nhật khi hoàn tất."
+        elif "playlist" in clean_target:
+            return f"Đã bắt đầu tải toàn bộ Playlist '{clean_target}' về kho nhạc máy chủ. Thư viện sẽ tự động cập nhật khi hoàn tất."
+        return f"Đã bắt đầu tải bài hát từ Spotify vào kho nhạc. Thư viện sẽ tự động cập nhật ngay khi hoàn tất."
 
-    # Nếu là link YouTube/web hoặc từ khóa tên bài hát
+    # Nếu là link YouTube/web hoặc từ khóa bài hát đơn lẻ
     if target.startswith("http://") or target.startswith("https://"):
         search_target = target
     else:
@@ -241,14 +256,14 @@ def download_music(query_or_url: str) -> str:
     cmd = (
         f"nohup bash -c 'yt-dlp -x --audio-format mp3 --audio-quality 0 "
         f"--embed-thumbnail --add-metadata "
-        f"-o \"{MUSIC_DOWNLOAD_DIR}/%(title)s.%(ext)s\" \"{search_target}\" "
+        f"-o \"{MUSIC_DOWNLOAD_DIR}/%(artist,uploader)s/%(album,title)s/%(playlist_index,track_number,1)02d - %(title)s.%(ext)s\" \"{search_target}\" "
         f"> /tmp/music_download_last.log 2>&1 && {refresh_hook}' > /dev/null 2>&1 &"
     )
     subprocess.Popen(cmd, shell=True)
-    return f"Đã bắt đầu tải bài hát '{target}' vào Jellyfin ({MUSIC_DOWNLOAD_DIR}). Khi tải xong, thư viện sẽ tự động làm mới ngay lập tức."
+    return f"Đã bắt đầu tải bài hát '{target}' vào kho nhạc ({MUSIC_DOWNLOAD_DIR}). Khi tải xong, thư viện sẽ tự động làm mới ngay lập tức."
 
 def download_spotify_track(url: str) -> str:
-    """Tải bài hát từ Spotify (tương thích ngược)."""
+    """Tải bài hát hoặc album từ Spotify (tương thích ngược)."""
     return download_music(url)
 
 def search_music(query: str, limit: int = 5) -> str:
