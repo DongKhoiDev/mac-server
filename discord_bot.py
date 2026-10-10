@@ -11,7 +11,10 @@ import google.generativeai as genai
 REPO_DIR = "/home/dongkhoi/mac-server"
 CHANNEL_CACHE_FILE = "/home/dongkhoi/.last_channel_id"
 SECRETS_FILE = "/home/dongkhoi/.secrets"
+MEDIA_DOWNLOAD_DIR = "/home/dongkhoi/Downloads/Media"
 ALLOWED_USER_ID = 932202011812823070
+
+os.makedirs(MEDIA_DOWNLOAD_DIR, exist_ok=True)
 
 DISCORD_TOKEN = ""
 GEMINI_API_KEY = ""
@@ -47,9 +50,10 @@ current_model_used = None
 SYSTEM_INSTRUCTION = (
     "Bạn là trợ lý điều hành máy chủ MacServerControl tên là JARVIS. "
     "Bạn duy trì ngữ cảnh trò chuyện xuyên suốt nhiều lượt với chủ nhân. "
-    "Bạn có sẵn các công cụ tra cứu phần cứng, kiểm tra tiến trình, quản trị dịch vụ Docker và thực thi lệnh shell Linux an toàn. "
-    "Khi chủ nhân hỏi về trạng thái các ứng dụng như Jellyfin, Immich, qBittorrent, hoặc yêu cầu xem log, khởi động lại dịch vụ, "
-    "hãy tự động kích hoạt công cụ thích hợp để thao tác thực tế trên máy rồi phản hồi ngắn gọn, chính xác."
+    "Bạn sở hữu các công cụ tra cứu phần cứng, kiểm tra tiến trình, quản trị dịch vụ Docker, "
+    "tải video media bằng yt-dlp và thực thi lệnh shell Linux an toàn. "
+    "Khi chủ nhân gửi link video, link magnet hoặc yêu cầu tải phim ảnh nhạc về máy chủ, "
+    "hãy lập tức gọi công cụ download tương ứng và phản hồi trạng thái một cách mạch lạc."
 )
 
 def get_system_stats() -> str:
@@ -140,6 +144,28 @@ def restart_docker_container(container_name: str) -> str:
     except Exception as e:
         return f"Lỗi khi thực thi khởi động container: {e}"
 
+def download_media_video(url: str, subfolder: str = "") -> str:
+    """Tải video chất lượng cao từ liên kết mạng bằng yt-dlp vào thư mục lưu trữ media máy chủ."""
+    target_dir = os.path.join(MEDIA_DOWNLOAD_DIR, subfolder.strip()) if subfolder else MEDIA_DOWNLOAD_DIR
+    os.makedirs(target_dir, exist_ok=True)
+    
+    cmd = (
+        f"nohup yt-dlp -f 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' "
+        f"--no-playlist -o '{target_dir}/%(title)s.%(ext)s' '{url}' "
+        f"> /tmp/ytdlp_last.log 2>&1 &"
+    )
+    subprocess.Popen(cmd, shell=True)
+    return f"Đã bắt đầu tiến trình tải video ngầm từ liên kết vào thư mục {target_dir}. Tệp nhật ký đang lưu tại /tmp/ytdlp_last.log."
+
+def add_magnet_link(magnet: str) -> str:
+    """Nạp liên kết magnet torrent vào trình tải trên máy chủ."""
+    if not magnet.startswith("magnet:?"):
+        return "Liên kết không đúng định dạng magnet link hợp lệ."
+    
+    cmd = f"transmission-remote -a '{magnet}' || qbittorrent-nox '{magnet}'"
+    subprocess.Popen(cmd, shell=True)
+    return "Đã tiếp nhận và đưa liên kết magnet vào hàng đợi tải xuống của máy chủ."
+
 def run_terminal_command(command: str) -> str:
     """Thực thi các lệnh Linux tra cứu an toàn trên hệ thống."""
     danger_keywords = ["rm -rf", "mkfs", "dd ", "shutdown", "reboot", "> /etc", "> /boot"]
@@ -165,6 +191,8 @@ TOOLS_LIST = [
     list_docker_containers,
     get_docker_logs,
     restart_docker_container,
+    download_media_video,
+    add_magnet_link,
     run_terminal_command
 ]
 
