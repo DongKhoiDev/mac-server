@@ -43,10 +43,15 @@ bot = commands.Bot(command_prefix="", intents=intents)
 last_alert_time = None
 is_alert_active = False
 
+# Biến lưu trữ phiên hội thoại dài hạn
+active_chat_session = None
+current_model_used = None
+
 SYSTEM_INSTRUCTION = (
     "Bạn là trợ lý điều hành máy chủ MacServerControl tên là JARVIS. "
+    "Bạn có trí nhớ ngữ cảnh để theo dõi mạch hội thoại với chủ nhân. "
     "Bạn sở hữu các công cụ tra cứu phần cứng, kiểm tra tiến trình và thực thi lệnh shell Linux. "
-    "Khi người dùng yêu cầu kiểm tra máy chủ, xem dung lượng, kiểm tra mạng, hoặc hỏi về các dịch vụ như Jellyfin, Immich, "
+    "Khi người dùng yêu cầu kiểm tra máy chủ, xem dung lượng các ổ SSD và HDD, kiểm tra mạng, hoặc hỏi về các dịch vụ như Jellyfin, Immich, "
     "hãy chủ động gọi công cụ phù hợp để lấy thông tin thật từ hệ thống rồi trả lời ngắn gọn, rành mạch."
 )
 
@@ -56,7 +61,6 @@ def get_system_stats() -> str:
     ram = psutil.virtual_memory()
     boot_time = datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S")
 
-    # Quét tất cả các ổ đĩa và phân vùng thực tế
     disk_lines = []
     seen_mounts = set()
     for part in psutil.disk_partitions(all=False):
@@ -67,19 +71,18 @@ def get_system_stats() -> str:
             usage = psutil.disk_usage(part.mountpoint)
             total_gb = usage.total // (1024**3)
             free_gb = usage.free // (1024**3)
-            disk_lines.append(f"  + {part.mountpoint} ({part.device}): Trống {free_gb} GB trên tổng {total_gb} GB, đã dùng {usage.percent}%")
+            disk_lines.append(f"  + {part.mountpoint} - thiết bị {part.device}: Trống {free_gb} GB trên tổng {total_gb} GB, đã dùng {usage.percent}%")
         except PermissionError:
             continue
 
-    disk_info = "\n".join(disk_lines) if disk_lines else "Không đọc được ổ đĩa."
+    disk_info = "\n".join(disk_lines) if disk_lines else "Không đọc được thông tin ổ đĩa."
 
     return (
         f"CPU: {cpu}%\n"
         f"RAM: {ram.percent}% - Dùng {ram.used // (1024**2)} MB trên tổng {ram.total // (1024**2)} MB\n"
-        f"Dung lượng các ổ đĩa:\n{disk_info}\n"
+        f"Dung lượng các phân vùng ổ đĩa:\n{disk_info}\n"
         f"Thời gian hoạt động từ: {boot_time}"
     )
-
 
 def get_top_processes(sort_by: str = "memory", limit: int = 10) -> str:
     """Tra cứu danh sách các tiến trình chiếm dụng nhiều tài nguyên nhất. sort_by có thể là memory hoặc cpu."""
@@ -151,24 +154,39 @@ async def send_chunked(destination, text: str, is_code: bool = False):
             await destination.send(chunk)
 
 async def ask_jarvis_agent(prompt: str) -> str:
+    global active_chat_session, current_model_used
     errors = []
-    for model_name in MODELS_TO_TRY:
-        try:
-            def _generate():
+
+    # Tạo phiên nếu chưa khởi tạo
+    if active_chat_session is None:
+        for model_name in MODELS_TO_TRY:
+            try:
                 model = genai.GenerativeModel(
                     model_name=model_name,
                     tools=TOOLS_LIST,
                     system_instruction=SYSTEM_INSTRUCTION
                 )
-                chat = model.start_chat(enable_automatic_function_calling=True)
-                resp = chat.send_message(prompt)
-                return resp.text
+                active_chat_session = model.start_chat(enable_automatic_function_calling=True)
+                current_model_used = model_name
+                break
+            except Exception as e:
+                errors.append(f"{model_name}: {e}")
+                continue
 
-            return await asyncio.to_thread(_generate)
-        except Exception as e:
-            errors.append(f"{model_name}: {e}")
-            continue
-    return "⚠️ Không có mô hình nào phản hồi:\n" + "\n".join(errors[:2])
+    if active_chat_session is None:
+        return "⚠️ Không thể kết nối mô hình AI:\n" + "\n".join(errors[:2])
+
+    # Gửi tin nhắn tiếp nối vào mạch hội thoại hiện tại
+    try:
+        def _send():
+            resp = active_chat_session.send_message(prompt)
+            return resp.text
+
+        return await asyncio.to_thread(_send)
+    except Exception as err:
+        # Nếu lỗi ngữ cảnh quá dài hoặc phiên bị ngắt, tự phục hồi bằng phiên mới
+        active_chat_session = None
+        return f"⚠️ Trục trặc phiên làm việc: {err}. Phiên đối thoại đã được đặt lại."
 
 @bot.event
 async def on_ready():
@@ -178,6 +196,7 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
+    global active_chat_session
     if message.author == bot.user:
         return
 
@@ -190,6 +209,12 @@ async def on_message(message):
 
     if content in ["ping", "!ping"]:
         await message.reply("Pong! Hệ thống MacServerControl sẵn sàng phục vụ.")
+        return
+
+    # Lệnh làm mới trí nhớ ngữ cảnh
+    if content in ["reset", "làm mới", "quên hết đi", "new chat"]:
+        active_chat_session = None
+        await message.reply("🧠 Đã xóa sạch bộ nhớ đệm hội thoại. Bắt đầu phiên làm việc mới.")
         return
 
     if content in ["restart", "!restart", "reboot bot"]:
