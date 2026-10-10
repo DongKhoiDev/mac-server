@@ -27,10 +27,10 @@ if os.path.exists(SECRETS_FILE):
                     GEMINI_API_KEY = v
 
 MODELS_TO_TRY = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
     "gemini-2.5-flash",
-    "gemini-2.0-flash"
+    "gemini-2.0-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite"
 ]
 
 if GEMINI_API_KEY:
@@ -42,6 +42,68 @@ bot = commands.Bot(command_prefix="", intents=intents)
 
 last_alert_time = None
 is_alert_active = False
+
+SYSTEM_INSTRUCTION = (
+    "Bạn là trợ lý điều hành máy chủ MacServerControl tên là JARVIS. "
+    "Bạn sở hữu các công cụ tra cứu phần cứng, kiểm tra tiến trình và thực thi lệnh shell Linux. "
+    "Khi người dùng yêu cầu kiểm tra máy chủ, xem dung lượng, kiểm tra mạng, hoặc hỏi về các dịch vụ như Jellyfin, Immich, "
+    "hãy chủ động gọi công cụ phù hợp để lấy thông tin thật từ hệ thống rồi trả lời ngắn gọn, rành mạch."
+)
+
+def get_system_stats() -> str:
+    """Tra cứu các chỉ số phần cứng hiện tại gồm CPU, RAM, dung lượng phân vùng ổ cứng và thời gian hoạt động."""
+    cpu = psutil.cpu_percent(interval=1)
+    ram = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+    boot_time = datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        f"CPU: {cpu}%\n"
+        f"RAM: {ram.percent}% - Dùng {ram.used // (1024**2)}MB trên tổng {ram.total // (1024**2)}MB\n"
+        f"Ổ cứng: {disk.percent}% - Trống {disk.free // (1024**3)}GB\n"
+        f"Thời gian hoạt động từ: {boot_time}"
+    )
+
+def get_top_processes(sort_by: str = "memory", limit: int = 10) -> str:
+    """Tra cứu danh sách các tiến trình chiếm dụng nhiều tài nguyên nhất. sort_by có thể là memory hoặc cpu."""
+    key = "cpu_percent" if sort_by.lower() == "cpu" else "memory_percent"
+    procs = []
+    for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]):
+        try:
+            procs.append(p.info)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    procs.sort(key=lambda x: x[key] or 0, reverse=True)
+    
+    header = f"{'PID':<7}{'TIẾN TRÌNH':<16}{'RAM':<7}{'CPU':<6}\n"
+    divider = "-" * 36 + "\n"
+    lines = [header, divider]
+    for p in procs[:limit]:
+        name = p['name'][:14] if p['name'] else "unknown"
+        mem = f"{p['memory_percent']:.1f}%" if p['memory_percent'] is not None else "0.0%"
+        cpu = f"{p['cpu_percent']:.1f}%" if p['cpu_percent'] is not None else "0.0%"
+        lines.append(f"{p['pid']:<7}{name:<16}{mem:<7}{cpu:<6}\n")
+    return "".join(lines)
+
+def run_terminal_command(command: str) -> str:
+    """Thực thi các lệnh Linux tra cứu an toàn như docker ps, kiểm tra log dịch vụ hoặc đo kiểm mạng."""
+    danger_keywords = ["rm -rf", "mkfs", "dd ", "shutdown", "reboot", "> /etc", "> /boot"]
+    if any(k in command for k in danger_keywords):
+        return "Lệnh bị chặn do nguy cơ gây hại hệ thống."
+    try:
+        res = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            cwd="/home/dongkhoi"
+        )
+        out = res.stdout if res.stdout else res.stderr
+        return out[:1500] if out else "Lệnh hoàn tất không có output."
+    except Exception as e:
+        return f"Lỗi chạy lệnh: {e}"
+
+TOOLS_LIST = [get_system_stats, get_top_processes, run_terminal_command]
 
 def save_last_channel(channel_id):
     try:
@@ -59,25 +121,6 @@ def get_last_channel_id():
             return None
     return None
 
-def get_top_processes(sort_by="memory_percent", limit=10):
-    procs = []
-    for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]):
-        try:
-            procs.append(p.info)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    procs.sort(key=lambda x: x[sort_by] or 0, reverse=True)
-    
-    header = f"{'PID':<7}{'TIẾN TRÌNH':<16}{'RAM':<7}{'CPU':<6}\n"
-    divider = "-" * 36 + "\n"
-    lines = [header, divider]
-    for p in procs[:limit]:
-        name = p['name'][:14] if p['name'] else "unknown"
-        mem = f"{p['memory_percent']:.1f}%" if p['memory_percent'] is not None else "0.0%"
-        cpu = f"{p['cpu_percent']:.1f}%" if p['cpu_percent'] is not None else "0.0%"
-        lines.append(f"{p['pid']:<7}{name:<16}{mem:<7}{cpu:<6}\n")
-    return "".join(lines)
-
 async def send_chunked(destination, text: str, is_code: bool = False):
     max_len = 1800
     if not text:
@@ -89,14 +132,21 @@ async def send_chunked(destination, text: str, is_code: bool = False):
         else:
             await destination.send(chunk)
 
-async def ask_gemini_with_fallback(prompt: str) -> str:
+async def ask_jarvis_agent(prompt: str) -> str:
     errors = []
     for model_name in MODELS_TO_TRY:
         try:
-            model = genai.GenerativeModel(model_name)
-            response = await asyncio.to_thread(model.generate_content, prompt)
-            if response and response.text:
-                return response.text
+            def _generate():
+                model = genai.GenerativeModel(
+                    model_name=model_name,
+                    tools=TOOLS_LIST,
+                    system_instruction=SYSTEM_INSTRUCTION
+                )
+                chat = model.start_chat(enable_automatic_function_calling=True)
+                resp = chat.send_message(prompt)
+                return resp.text
+
+            return await asyncio.to_thread(_generate)
         except Exception as e:
             errors.append(f"{model_name}: {e}")
             continue
@@ -120,33 +170,8 @@ async def on_message(message):
     raw_content = message.content.strip()
     content = raw_content.lower()
 
-    if content in ["ping", "!ping", "hi", "hello"]:
-        await message.reply("Pong! Bot MacServerControl đang hoạt động bình thường.")
-        return
-
-    if content in ["stats", "!stats", "status"]:
-        cpu = psutil.cpu_percent(interval=1)
-        ram = psutil.virtual_memory()
-        disk = psutil.disk_usage("/")
-        boot_time = datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S")
-        stats_text = (
-            f"📊 **TRẠNG THÁI HỆ THỐNG MAC-SERVER**\n"
-            f"- **CPU:** {cpu}%\n"
-            f"- **RAM:** {ram.percent}% Dùng: {ram.used // (1024**2)}MB / {ram.total // (1024**2)}MB\n"
-            f"- **Ổ cứng:** {disk.percent}% Còn trống: {disk.free // (1024**3)}GB\n"
-            f"- **Thời gian bật:** {boot_time}"
-        )
-        await message.reply(stats_text)
-        return
-
-    if any(k in content for k in ["ngốn ram", "top ram", "tiến trình ram", "topram"]):
-        table = get_top_processes(sort_by="memory_percent", limit=10)
-        await message.reply(f"📈 **Top 10 tiến trình chiếm nhiều RAM nhất:**\n```text\n{table}```")
-        return
-
-    if any(k in content for k in ["ngốn cpu", "top cpu", "tiến trình cpu", "topcpu"]):
-        table = get_top_processes(sort_by="cpu_percent", limit=10)
-        await message.reply(f"📈 **Top 10 tiến trình chiếm nhiều CPU nhất:**\n```text\n{table}```")
+    if content in ["ping", "!ping"]:
+        await message.reply("Pong! Hệ thống MacServerControl sẵn sàng phục vụ.")
         return
 
     if content in ["restart", "!restart", "reboot bot"]:
@@ -158,7 +183,7 @@ async def on_message(message):
         return
 
     if content in ["cập nhật bot", "cap nhat bot", "update bot", "git pull"]:
-        status_msg = await message.reply("🔄 Đang kiểm tra và tải mã nguồn mới từ Git...")
+        status_msg = await message.reply("🔄 Đang kéo mã nguồn mới từ kho Git...")
         proc_pull = await asyncio.create_subprocess_shell(
             "git pull origin main",
             stdout=subprocess.PIPE,
@@ -185,7 +210,7 @@ async def on_message(message):
             await status_msg.edit(content=f"⚠️ Bản cập nhật lỗi cú pháp. Đã tự rollback về bản cũ.\n```{err_msg}```")
             return
 
-        await status_msg.edit(content=f"✅ Cập nhật thành công.\n```{out[:250]}```\nKhởi động lại bot sau 2 giây...")
+        await status_msg.edit(content=f"✅ Cập nhật thành công.\n```{out[:250]}```\nKhởi động lại sau 2 giây...")
         subprocess.Popen("nohup bash -c 'sleep 2 && sudo systemctl restart discord-bot' > /dev/null 2>&1 &", shell=True)
         return
 
@@ -213,11 +238,12 @@ async def on_message(message):
             await status_msg.edit(content=f"❌ Lỗi thực thi: `{e}`")
         return
 
-    try:
-        reply_text = await ask_gemini_with_fallback(raw_content)
-        await send_chunked(message.channel, reply_text, is_code=False)
-    except Exception as e:
-        await message.reply(f"❌ Lỗi AI: {e}")
+    async with message.channel.typing():
+        try:
+            reply_text = await ask_jarvis_agent(raw_content)
+            await send_chunked(message.channel, reply_text, is_code=False)
+        except Exception as e:
+            await message.reply(f"❌ Lỗi xử lý: {e}")
 
 @tasks.loop(minutes=2)
 async def monitor_health():
