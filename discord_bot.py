@@ -53,6 +53,73 @@ is_alert_active = False
 active_chat_session = None
 current_model_used = None
 
+
+
+async def run_async_download_and_notify(cmd: str, target_name: str, channel_id: int, log_file: str, is_music: bool = True):
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            f"{cmd} > {log_file} 2>&1"
+        )
+        await proc.communicate()
+
+        channel = None
+        if channel_id:
+            channel = bot.get_channel(channel_id)
+            if not channel:
+                try:
+                    channel = await bot.fetch_channel(channel_id)
+                except Exception:
+                    channel = None
+
+        if proc.returncode == 0:
+            if is_music:
+                try:
+                    refresh_jellyfin_library()
+                except Exception:
+                    pass
+                if channel:
+                    await channel.send(
+                        f"✅ **ĐÃ TẢI XONG:** `{target_name}`\n"
+                        f"🎧 Đã tự động cập nhật vào **Jellyfin & Navidrome**.\n"
+                        f"Sếp mở **Ampsonic** trên iPhone là có thể thưởng thức ngay rồi ạ! 🎵"
+                    )
+            else:
+                if channel:
+                    await channel.send(
+                        f"✅ **ĐÃ TẢI XONG VIDEO:** `{target_name}`\n"
+                        f"📁 Đã lưu vào thư mục Media trên máy chủ."
+                    )
+        else:
+            err_summary = "Lỗi tiến trình tải."
+            if os.path.exists(log_file):
+                try:
+                    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = [line.strip() for line in f.readlines() if line.strip()]
+                        if lines:
+                            err_summary = "\n".join(lines[-4:])
+                except Exception:
+                    pass
+            if channel:
+                await channel.send(
+                    f"⚠️ **TẢI THẤT BÀI:** `{target_name}`\n"
+                    f"```text\n{err_summary[:400]}\n```"
+                )
+    except Exception as e:
+        print(f"Lỗi task tải ngầm: {e}", flush=True)
+
+def dispatch_download_task(cmd: str, target_name: str, log_file: str, is_music: bool = True):
+    ch_id = get_last_channel_id()
+    try:
+        if bot.loop and bot.loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                run_async_download_and_notify(cmd, target_name, ch_id, log_file, is_music=is_music),
+                bot.loop
+            )
+            return True
+    except Exception as e:
+        print(f"Lỗi dispatch task: {e}", flush=True)
+    return False
+
 SYSTEM_INSTRUCTION = (
     "Bạn là trợ lý điều hành máy chủ MacServerControl tên là JARVIS. "
     "Bạn duy trì ngữ cảnh trò chuyện xuyên suốt nhiều lượt với sếp. "
@@ -164,12 +231,11 @@ def download_media_video(url: str, subfolder: str = "") -> str:
     os.makedirs(target_dir, exist_ok=True)
     
     cmd = (
-        f"nohup yt-dlp -f 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' "
-        f"--no-playlist -o '{target_dir}/%(title)s.%(ext)s' '{url}' "
-        f"> /tmp/ytdlp_last.log 2>&1 &"
+        f"yt-dlp -f 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' "
+        f"--no-playlist -o '{target_dir}/%(title)s.%(ext)s' '{url}'"
     )
-    subprocess.Popen(cmd, shell=True)
-    return f"Đã bắt đầu tiến trình tải video ngầm từ liên kết vào thư mục {target_dir}. Tệp nhật ký đang lưu tại /tmp/ytdlp_last.log."
+    dispatch_download_task(cmd, url, "/tmp/ytdlp_last.log", is_music=False)
+    return f"Đã bắt đầu tải video ngầm từ '{url}' vào thư mục {target_dir}. Tôi sẽ tự động thông báo vào đây ngay khi video tải xong."
 
 def add_magnet_link(magnet: str) -> str:
     """Nạp liên kết magnet torrent vào trình tải trên máy chủ."""
@@ -226,7 +292,6 @@ def download_music(query_or_url: str) -> str:
     if not target:
         return "Vui lòng cung cấp tên bài hát, album hoặc liên kết hợp lệ."
 
-    refresh_hook = f"curl -s -X POST '{JELLYFIN_URL}/Library/Refresh' -H 'X-Emby-Token: {JELLYFIN_API_KEY}'"
     output_tpl = f"{MUSIC_DOWNLOAD_DIR}/{{artist}}/{{album}}/{{track-number}} - {{title}}.{{output-ext}}"
 
     lower_target = target.lower()
@@ -234,18 +299,15 @@ def download_music(query_or_url: str) -> str:
 
     if is_spotify:
         clean_target = target.split("?")[0].strip() if "open.spotify.com" in target else target
-        cmd = (
-            f"nohup bash -c 'spotdl --output \"{output_tpl}\" \"{clean_target}\" "
-            f"> /tmp/music_download_last.log 2>&1 && {refresh_hook}' > /dev/null 2>&1 &"
-        )
-        subprocess.Popen(cmd, shell=True)
+        cmd = f"spotdl --output \"{output_tpl}\" \"{clean_target}\""
+        dispatch_download_task(cmd, clean_target, "/tmp/music_download_last.log", is_music=True)
         if "album" in clean_target:
-            return f"Đã bắt đầu quét và tải trọn bộ Album '{clean_target}' về kho nhạc máy chủ. Jellyfin và Navidrome sẽ tự động cập nhật khi hoàn tất."
+            return f"Đã bắt đầu quét và tải trọn bộ Album '{clean_target}' về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi tải xong và đồng bộ vào Jellyfin & Navidrome."
         elif "artist" in clean_target:
-            return f"Đã bắt đầu quét và tải các bài hát của Nghệ sĩ '{clean_target}' về kho nhạc máy chủ. Thư viện sẽ tự động cập nhật khi hoàn tất."
+            return f"Đã bắt đầu quét và tải các bài hát của Nghệ sĩ '{clean_target}' về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
         elif "playlist" in clean_target:
-            return f"Đã bắt đầu tải toàn bộ Playlist '{clean_target}' về kho nhạc máy chủ. Thư viện sẽ tự động cập nhật khi hoàn tất."
-        return f"Đã bắt đầu tải bài hát từ Spotify vào kho nhạc. Thư viện sẽ tự động cập nhật ngay khi hoàn tất."
+            return f"Đã bắt đầu tải toàn bộ Playlist '{clean_target}' về kho nhạc máy chủ. Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
+        return f"Đã bắt đầu tải bài hát từ Spotify vào kho nhạc. Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
 
     # Nếu là link YouTube/web hoặc từ khóa bài hát đơn lẻ
     if target.startswith("http://") or target.startswith("https://"):
@@ -254,13 +316,12 @@ def download_music(query_or_url: str) -> str:
         search_target = f"ytsearch1:{target}"
 
     cmd = (
-        f"nohup bash -c 'yt-dlp -x --audio-format mp3 --audio-quality 0 "
+        f"yt-dlp -x --audio-format mp3 --audio-quality 0 "
         f"--embed-thumbnail --add-metadata "
-        f"-o \"{MUSIC_DOWNLOAD_DIR}/%(artist,uploader)s/%(album,title)s/%(playlist_index,track_number,1)02d - %(title)s.%(ext)s\" \"{search_target}\" "
-        f"> /tmp/music_download_last.log 2>&1 && {refresh_hook}' > /dev/null 2>&1 &"
+        f"-o \"{MUSIC_DOWNLOAD_DIR}/%(artist,uploader)s/%(album,title)s/%(playlist_index,track_number,1)02d - %(title)s.%(ext)s\" \"{search_target}\""
     )
-    subprocess.Popen(cmd, shell=True)
-    return f"Đã bắt đầu tải bài hát '{target}' vào kho nhạc ({MUSIC_DOWNLOAD_DIR}). Khi tải xong, thư viện sẽ tự động làm mới ngay lập tức."
+    dispatch_download_task(cmd, target, "/tmp/music_download_last.log", is_music=True)
+    return f"Đã bắt đầu tải bài hát '{target}' vào kho nhạc ({MUSIC_DOWNLOAD_DIR}). Tôi sẽ tự động thông báo vào đây ngay khi hoàn tất."
 
 def download_spotify_track(url: str) -> str:
     """Tải bài hát hoặc album từ Spotify (tương thích ngược)."""
